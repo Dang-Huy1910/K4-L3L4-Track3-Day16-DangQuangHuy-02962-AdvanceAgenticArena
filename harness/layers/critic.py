@@ -72,6 +72,55 @@ from __future__ import annotations
 
 from harness.middleware import Middleware
 
+_GLUE = " và "
+
+
+def _matches_a_line(text: str, body: str) -> bool:
+    if not text or not body:
+        return False
+    return any(text in line for line in body.splitlines())
+
+
+def _source_doc_id(ctx, text: str) -> str | None:
+    """First fully-observed document whose one LINE contains `text`."""
+    if not text or ctx.corpus is None:
+        return None
+    observed = ctx.observed_text
+    for doc in ctx.corpus.docs:
+        if doc.body and doc.body in observed and _matches_a_line(text, doc.body):
+            return doc.doc_id
+    return None
+
+
+def _split_fused(ctx, text: str) -> list[dict] | None:
+    """Split a glued contradiction sentence into two observed halves."""
+    start = 0
+    while True:
+        idx = text.find(_GLUE, start)
+        if idx == -1:
+            return None
+        left, right = text[:idx], text[idx + len(_GLUE) :]
+        if left and right and ctx.saw(left) and ctx.saw(right):
+            left_id = _source_doc_id(ctx, left)
+            right_id = _source_doc_id(ctx, right)
+            if left_id and right_id and left_id != right_id:
+                return [
+                    {"text": left, "doc_id": left_id},
+                    {"text": right, "doc_id": right_id},
+                ]
+        start = idx + 1
+
+
+def _citation_ids(claims: list) -> list[str]:
+    ids: set[str] = set()
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        doc_id = claim.get("doc_id")
+        if isinstance(doc_id, str) and doc_id:
+            ids.add(doc_id)
+    return sorted(ids)
+
 
 class Critic(Middleware):
     """Xoá những gì bằng chứng không đỡ; abstain khi không còn gì."""
@@ -79,16 +128,37 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            return report
+
+        kept: list = []
+        split_conflict = False
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            if ctx.saw(text):
+                kept.append(claim)
+                continue
+            halves = _split_fused(ctx, text)
+            if halves:
+                kept.extend(halves)
+                split_conflict = True
+                continue
+
+        if split_conflict:
+            report["abstain"] = True
+
+        if not kept:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ trong tài liệu đã quan sát để trả lời."
+            return report
+
+        report["claims"] = kept
+        report["citations"] = _citation_ids(kept)
+        return report
